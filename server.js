@@ -73,7 +73,7 @@ function toNum(v) {
 
 // --- Algoritmo rosa (placeholder base) ---
 const CFG = {
-  budgetMin: 380, budgetMax: 500, maxTries: 150,
+  budgetMin: 380, budgetMax: 500, maxTries: 500,
   rolesCount: { P: 3, D: 8, C: 8, A: 6 },
   pct: {
     equilibrata: { P:[0.04,0.08], D:[0.08,0.14], C:[0.20,0.30], A:[0.56,0.64] },
@@ -97,7 +97,7 @@ function pickTeam(players, mode, seed = crypto.randomUUID()) {
     const team = { P:[], D:[], C:[], A:[] };
     ["P","D","C","A"].forEach(R=>{
       const need = CFG.rolesCount[R];
-      let pool = byRole[R].slice(0, Math.min(60, byRole[R].length));
+      let pool = byRole[R].slice(0, Math.min(120, byRole[R].length));
       while (team[R].length < need && pool.length) {
         const i = Math.floor(rng()*pool.length);
         team[R].push(pool.splice(i,1)[0]);
