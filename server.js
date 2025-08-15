@@ -32,7 +32,33 @@ const auth = new google.auth.JWT(
 );
 const sheets = google.sheets({ version: "v4", auth });
 
-// === Cache semplice (10 minuti) ===
+// === Normalizzatori e mapping ruoli ===
+function toNum(v) {
+  if (v == null || v === "") return 0;
+  return Number(String(v).replace(/\./g, "").replace(",", ".")) || 0;
+}
+function cleanStr(s){ return String(s || "").trim(); }
+
+// Mappa ruoli scritti per esteso/variazioni → P/D/C/A
+function mapRole(raw){
+  const x = cleanStr(raw).toLowerCase();
+
+  // base italiani + varianti comuni
+  if (x === "p" || x.includes("port")) return "P"; // Portiere, Port., Por
+  if (x === "d" || x.includes("dif")) return "D";  // Difensore, Dif., DC/DS/TD/TS
+  if (x === "c" || x.includes("centro") || x.includes("med")) return "C"; // Centrocampista, Mediano
+  if (x === "a" || x.includes("att") || x.includes("punta") || x.includes("ala") || x.includes("est")) return "A"; // Attaccante, Punta, Ala, Esterno
+
+  // fallback con iniziale/parola
+  if (/^port/.test(x)) return "P";
+  if (/^dif/.test(x))  return "D";
+  if (/^centro|^med/.test(x)) return "C";
+  if (/^att|^punta|^ala|^est/.test(x)) return "A";
+
+  return ""; // sconosciuto → scarto
+}
+
+// === Lettura robusta da Google Sheets (cache 10 min) ===
 let CACHE = { at: 0, rows: [] };
 async function readPlayers() {
   const now = Date.now();
@@ -40,41 +66,65 @@ async function readPlayers() {
 
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
-    range: "Database Fantacalcio!A:G"
+    range: "Database Fantacalcio!A:Z" // range largo, ordine colonne libero
   });
 
   const values = res.data.values || [];
-  if (!values.length) return [];
+  if (!values.length) { CACHE = { at: now, rows: [] }; return []; }
 
   const [header, ...data] = values;
-  const idx = Object.fromEntries(header.map((h, i) => [String(h || "").trim(), i]));
+  const H = header.map(h => cleanStr(h));
 
-  const rows = data
-    .map(r => ({
-      Nome: r[idx["Nome"]],
-      Squadra: r[idx["Squadra"]],
-      Ruolo: r[idx["Ruolo"]],
-      Media_Voto: toNum(r[idx["Media_Voto"]]),
-      Fantamedia: toNum(r[idx["Fantamedia"]]),
-      Quotazione: toNum(r[idx["Quotazione"]]),
-      Partite_Voto: toNum(r[idx["Partite_Voto"]])
-    }))
-    // filtra righe senza dati utili (tranne Quotazione, che può essere 0)
-    .filter(x => x && x.Nome && x.Ruolo && (x.Partite_Voto > 0 || x.Fantamedia > 0));
+  // trova indice colonna (tollerante a spazi/underscore)
+  const findIdx = (name) => {
+    const candidates = [name, name.replace(/\s+/g,"_"), name.replace(/\s+/g,"")];
+    for (const c of candidates) {
+      const i = H.findIndex(h => h.toLowerCase() === c.toLowerCase());
+      if (i >= 0) return i;
+    }
+    const i2 = H.findIndex(h => h.toLowerCase().includes(name.toLowerCase()));
+    return i2 >= 0 ? i2 : -1;
+  };
+
+  const idx = {
+    Nome:         findIdx("Nome"),
+    Squadra:      findIdx("Squadra"),
+    Ruolo:        findIdx("Ruolo"),          // accetta anche “Posizione/Role” via match parziale
+    Media_Voto:   findIdx("Media_Voto"),
+    Fantamedia:   findIdx("Fantamedia"),
+    Quotazione:   findIdx("Quotazione"),
+    Partite_Voto: findIdx("Partite_Voto"),
+  };
+
+  // minimi indispensabili
+  if (idx.Nome < 0 || idx.Ruolo < 0 || idx.Quotazione < 0) {
+    throw new Error("Header mancanti: servono almeno Nome, Ruolo, Quotazione nella riga 1 (linguetta 'Database Fantacalcio').");
+  }
+
+  const rows = data.map(r => {
+    const ruolo = mapRole(r[idx.Ruolo]);
+    return {
+      Nome: cleanStr(r[idx.Nome]),
+      Squadra: idx.Squadra >= 0 ? cleanStr(r[idx.Squadra]) : "",
+      Ruolo: ruolo,
+      Media_Voto: idx.Media_Voto >= 0 ? toNum(r[idx.Media_Voto]) : 0,
+      Fantamedia: idx.Fantamedia >= 0 ? toNum(r[idx.Fantamedia]) : 0,
+      Quotazione: toNum(r[idx.Quotazione]),
+      Partite_Voto: idx.Partite_Voto >= 0 ? toNum(r[idx.Partite_Voto]) : 0,
+    };
+  })
+  // filtra righe senza ruolo riconosciuto o senza nome
+  .filter(x => x.Nome && ["P","D","C","A"].includes(x.Ruolo) && Number.isFinite(x.Quotazione));
 
   CACHE = { at: now, rows };
   return rows;
-}
-function toNum(v) {
-  if (v == null || v === "") return 0;
-  return Number(String(v).replace(".", "").replace(",", ".")) || 0;
 }
 
 // === Config & util ===
 const CFG = {
   budgetMin: 380,
-  budgetMax: 500,        // puoi alzare a 520 se i tuoi dati sono “costosi”
-  maxTries: 500,         // aumentato da 150 a 500
+  budgetMax: 500,        // alza a 520 se i tuoi dati sono “costosi”
+  maxTries: 500,         // aumentato
   rolesCount: { P: 3, D: 8, C: 8, A: 6 },
   pct: {
     equilibrata: { P:[0.04,0.08], D:[0.08,0.14], C:[0.20,0.30], A:[0.56,0.64] },
@@ -85,12 +135,13 @@ function sum(arr){ return arr.reduce((s,p)=>s+(p.Quotazione||0),0); }
 function hashSeed(s){ return [...Buffer.from(s)].reduce((a,b)=>((a<<5)-a+b)>>>0, 2166136261); }
 function mulberry32(a){ return function(){ let t=a+=0x6D2B79F5; t=Math.imul(t^t>>>15,t|1); t^=t+Math.imul(t^t>>>7,t|61); return ((t^t>>>14)>>>0)/4294967296; } }
 
+// === Algoritmo con pool 120, tolleranza a scalini ===
 function pickTeam(players, mode, seed = crypto.randomUUID(), budgetMin = CFG.budgetMin, budgetMax = CFG.budgetMax) {
   const rng = mulberry32(hashSeed(seed));
   const byRole = { P:[], D:[], C:[], A:[] };
   players.forEach(p => { if (byRole[p.Ruolo]) byRole[p.Ruolo].push(p); });
 
-  // Ordina per priorità: Partite_Voto, Fantamedia, Quotazione
+  // ordina per priorità: Partite_Voto, Fantamedia, Quotazione
   Object.values(byRole).forEach(arr =>
     arr.sort((a,b) =>
       (b.Partite_Voto - a.Partite_Voto) ||
@@ -99,38 +150,13 @@ function pickTeam(players, mode, seed = crypto.randomUUID(), budgetMin = CFG.bud
     )
   );
 
-  // Traccia il miglior candidato anche se non perfetto
-  let best = null;
-  let bestScore = Infinity;
-
-  const scoreCandidate = (team, total, pctSpent) => {
-    // Penalità budget: distanza dal range
-    let budgetPenalty = 0;
-    if (total < budgetMin) budgetPenalty = (budgetMin - total);
-    else if (total > budgetMax) budgetPenalty = (total - budgetMax);
-
-    // Penalità percentuali: distanza fuori dai range base (più è fuori, peggio è)
-    const base = CFG.pct[mode];
-    const pctPenalty = ["P","D","C","A"].reduce((acc, r) => {
-      const lo = base[r][0], hi = base[r][1];
-      const v = pctSpent[r];
-      if (v < lo) return acc + (lo - v) * 1000;  // pesi alti per rispetto % ruolo
-      if (v > hi) return acc + (v - hi) * 1000;
-      return acc;
-    }, 0);
-
-    // Penalità squilibri interni (facoltativo: somma varianza)
-    const balancePenalty = Math.abs(pctSpent.P - base.P[0]) + Math.abs(pctSpent.D - base.D[0]) + Math.abs(pctSpent.C - base.C[0]) + Math.abs(pctSpent.A - base.A[0]);
-
-    return budgetPenalty * 10 + pctPenalty + balancePenalty; // mix di pesi
-  };
-
   for (let t=0; t<CFG.maxTries; t++) {
     const team = { P:[], D:[], C:[], A:[] };
 
     ["P","D","C","A"].forEach(R=>{
       const need = CFG.rolesCount[R];
-      let pool = byRole[R].slice(0, Math.min(120, byRole[R].length)); // pool 120
+      // pool ampliato a 120
+      let pool = byRole[R].slice(0, Math.min(120, byRole[R].length));
       while (team[R].length < need && pool.length) {
         const i = Math.floor(rng()*pool.length);
         team[R].push(pool.splice(i,1)[0]);
@@ -141,36 +167,63 @@ function pickTeam(players, mode, seed = crypto.randomUUID(), budgetMin = CFG.bud
     if (flat.length !== 25) continue;
 
     const total = flat.reduce((s,p)=>s+(p.Quotazione||0),0);
+    if (total < budgetMin || total > budgetMax) continue;
+
     const pctSpent = {
       P: sum(team.P)/total, D: sum(team.D)/total,
       C: sum(team.C)/total, A: sum(team.A)/total
     };
 
-    // 1) Prova range stretti
+    // controllo percentuali per ruolo con tolleranza a scalini
     const base = CFG.pct[mode];
+    if (!base) throw new Error("Modalità non riconosciuta");
     const within = (r, tilt=0) => {
       const lo = Math.max(0, base[r][0] - tilt);
       const hi = Math.min(1, base[r][1] + tilt);
       return pctSpent[r] >= lo && pctSpent[r] <= hi;
     };
+
     const okStrict   = ["P","D","C","A"].every(r => within(r, 0));
     const okSoft02   = ["P","D","C","A"].every(r => within(r, 0.02));
     const okSoft05   = ["P","D","C","A"].every(r => within(r, 0.05));
 
-    if (total >= budgetMin && total <= budgetMax && (okStrict || okSoft02 || okSoft05)) {
-      return { team, total, pctSpent, seed }; // trovato valido → esci
+    if (okStrict || okSoft02 || okSoft05) {
+      return { team, total, pctSpent, seed };
     }
-
-    // 2) Aggiorna best candidate
-    const s = scoreCandidate(team, total, pctSpent);
-    if (s < bestScore) { bestScore = s; best = { team, total, pctSpent, seed }; }
   }
 
-  // 3) Fallback: restituisci il migliore trovato (mai errore)
-  if (best) return best;
+  throw new Error("Impossibile generare la rosa entro i tentativi massimi");
+}
 
-  // Estremo: nessun candidato (dataset vuoto)
-  throw new Error("Impossibile generare la rosa: dataset insufficiente");
+// === Fallback: sempre una rosa valida (i più economici per ruolo) ===
+function pickFallbackCheapest(players, seed = crypto.randomUUID()) {
+  const byRole = { P:[], D:[], C:[], A:[] };
+  players.forEach(p => { if (byRole[p.Ruolo]) byRole[p.Ruolo].push(p); });
+  const need = { P:3, D:8, C:8, A:6 };
+
+  for (const r of ["P","D","C","A"]) {
+    byRole[r].sort((a,b) =>
+      (a.Quotazione - b.Quotazione) ||
+      (b.Fantamedia - a.Fantamedia) ||
+      (b.Partite_Voto - a.Partite_Voto)
+    );
+    if (byRole[r].length < need[r]) throw new Error(`Dataset insufficiente per ruolo ${r}`);
+  }
+
+  const team = {
+    P: byRole.P.slice(0, need.P),
+    D: byRole.D.slice(0, need.D),
+    C: byRole.C.slice(0, need.C),
+    A: byRole.A.slice(0, need.A),
+  };
+  const total = [...team.P, ...team.D, ...team.C, ...team.A].reduce((s,p)=>s+(p.Quotazione||0),0);
+  const pctSpent = {
+    P: team.P.reduce((s,p)=>s+(p.Quotazione||0),0) / (total||1),
+    D: team.D.reduce((s,p)=>s+(p.Quotazione||0),0) / (total||1),
+    C: team.C.reduce((s,p)=>s+(p.Quotazione||0),0) / (total||1),
+    A: team.A.reduce((s,p)=>s+(p.Quotazione||0),0) / (total||1),
+  };
+  return { team, total, pctSpent, seed, fallback: true };
 }
 
 // === PDF (pdfkit) ===
@@ -236,6 +289,22 @@ app.get("/health", (req, res) => {
   res.json({ ok: true, service: "fantaelite-backend", time: new Date().toISOString() });
 });
 
+// === Debug: cosa c'è nel dataset ===
+app.get("/debug/dataset", async (req, res) => {
+  try {
+    const players = await readPlayers();
+    const byR = { P:0, D:0, C:0, A:0 };
+    players.forEach(p => { if (byR[p.Ruolo] != null) byR[p.Ruolo]++; });
+    res.json({
+      count: players.length,
+      byRole: byR,
+      sample: players.slice(0, 5)
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // === Test solo email (utile per debug SMTP) ===
 app.post("/api/test-email", async (req, res) => {
   try {
@@ -255,7 +324,7 @@ app.post("/api/test-email", async (req, res) => {
 });
 
 // === Test generate (manuale) ===
-// accetta facoltativamente budgetMin/budgetMax per sbloccare dataset “costosi”
+// 3 livelli: normale → budgetMax allargato → fallback cheapest (mai 500 se dati minimi ci sono)
 app.post("/api/test-generate", async (req,res)=>{
   try{
     if (req.headers.authorization !== `Bearer ${API_KEY}`) return res.status(401).end();
@@ -265,48 +334,47 @@ app.post("/api/test-generate", async (req,res)=>{
     const players = await readPlayers();
     const seed = crypto.randomUUID();
 
-    if (mode === "complete"){
-      // Equilibrata
-      const one = pickTeam(players, "equilibrata", seed, budgetMin || CFG.budgetMin, budgetMax || CFG.budgetMax);
-
-      // ModDifesa con diversità >=60%
-      let two;
-      for (let i=0;i<CFG.maxTries;i++){
-        const tmp = pickTeam(players, "moddifesa", crypto.randomUUID(), budgetMin || CFG.budgetMin, budgetMax || CFG.budgetMax);
-        const baseNames = new Set([...one.team.P, ...one.team.D, ...one.team.C, ...one.team.A].map(p=>p.Nome));
-        const twoFlat = [...tmp.team.P,...tmp.team.D,...tmp.team.C,...tmp.team.A].map(p=>p.Nome);
-        const inter = twoFlat.filter(n=>baseNames.has(n)).length;
-        const uniq = 25;
-        if (inter/uniq <= 0.4) { two = tmp; break; } // <=40% overlap → >=60% diversi
+    const doOne = async (m) => {
+      try {
+        // 1° tentativo: vincoli normali (con eventuale budget custom dal body)
+        const out = pickTeam(players, m, seed, budgetMin || CFG.budgetMin, budgetMax || CFG.budgetMax);
+        const pdf = await renderPdf({ mode: m, payload: out });
+        await sendEmail(email,
+          `FantaElite — La tua rosa (${m==="equilibrata"?"Equilibrata":"Mod. Difesa"})`,
+          "Grazie per l'acquisto! In allegato trovi il PDF della tua rosa.",
+          [{ filename:`FantaElite_${m==="equilibrata"?"Equilibrata":"ModDifesa"}.pdf`, content: pdf }]
+        );
+      } catch {
+        try {
+          // 2° tentativo: allargo budget
+          const out2 = pickTeam(players, m, seed, (budgetMin||CFG.budgetMin), Math.max(540, budgetMax||CFG.budgetMax));
+          const pdf2 = await renderPdf({ mode: m, payload: out2 });
+          await sendEmail(email,
+            `FantaElite — La tua rosa (${m==="equilibrata"?"Equilibrata":"Mod. Difesa"})`,
+            "Nota: vincoli allargati per garantire la generazione della rosa.",
+            [{ filename:`FantaElite_${m==="equilibrata"?"Equilibrata":"ModDifesa"}.pdf`, content: pdf2 }]
+          );
+        } catch {
+          // 3° tentativo: fallback cheapest (mai errore se ci sono abbastanza righe per ruolo)
+          const out3 = pickFallbackCheapest(players, seed);
+          const pdf3 = await renderPdf({ mode: m, payload: out3 });
+          await sendEmail(email,
+            `FantaElite — La tua rosa (${m==="equilibrata"?"Equilibrata":"Mod. Difesa"})`,
+            "Nota: generazione in modalità di sicurezza (rosa più economica per ruolo).",
+            [{ filename:`FantaElite_${m==="equilibrata"?"Equilibrata":"ModDifesa"}.pdf`, content: pdf3 }]
+          );
+        }
       }
-      if (!two) throw new Error("Impossibile garantire diversità >=60%");
+    };
 
-      const [pdf1, pdf2] = await Promise.all([
-        renderPdf({ mode: "equilibrata", payload: one }),
-        renderPdf({ mode: "moddifesa",   payload: two })
-      ]);
-
-      const zip = new JSZip();
-      zip.file(`FantaElite_Equilibrata.pdf`, pdf1);
-      zip.file(`FantaElite_ModDifesa.pdf`, pdf2);
-      const zipBuf = await zip.generateAsync({ type: "nodebuffer" });
-
-      await sendEmail(email,
-        "FantaElite — Le tue rose (Equilibrata + Mod. Difesa)",
-        "Grazie per l'acquisto! In allegato trovi i PDF delle due rose.",
-        [{ filename:"FantaElite_Rose.zip", content: zipBuf }]
-      );
+    if (mode === "complete"){
+      await doOne("equilibrata");
+      await doOne("moddifesa");
+      return res.json({ ok:true, note:"invio doppio effettuato (due email separate in test)" });
     } else {
-      const out = pickTeam(players, mode, seed, budgetMin || CFG.budgetMin, budgetMax || CFG.budgetMax);
-      const pdf = await renderPdf({ mode, payload: out });
-      await sendEmail(email,
-        `FantaElite — La tua rosa (${mode === "equilibrata"?"Equilibrata":"Mod. Difesa"})`,
-        "Grazie per l'acquisto! In allegato trovi il PDF della tua rosa.",
-        [{ filename:`FantaElite_${mode==="equilibrata"?"Equilibrata":"ModDifesa"}.pdf`, content: pdf }]
-      );
+      await doOne(mode);
+      return res.json({ ok:true });
     }
-
-    res.json({ ok:true });
   }catch(e){
     console.error(e);
     res.status(500).json({ error:e.message });
@@ -316,18 +384,15 @@ app.post("/api/test-generate", async (req,res)=>{
 // === Webhook Ko-fi ===
 app.post("/webhook/kofi", async (req, res) => {
   try {
-    // Firma Ko-fi: per i primi test puoi lasciare vuoto KOFI_WEBHOOK_SECRET
     const provided = (req.headers["x-ko-fi-signature"] || req.headers["x-kofi-signature"] || "").toString();
     if (KOFI_WEBHOOK_SECRET && provided !== KOFI_WEBHOOK_SECRET) {
       return res.status(401).json({ ok:false, error:"Firma non valida" });
     }
 
     const ev = req.body || {};
-    // prova vari possibili campi email
     const email = (ev.email || ev.payer_email || ev.from || "").toString().trim().toLowerCase();
     if (!email) return res.status(400).json({ ok:false, error:"Email mancante nel webhook" });
 
-    // riconoscimento prodotto
     const label = [ev.item, ev.tier, ev.shop_item, ev.message].filter(Boolean).join(" ").toLowerCase();
     const isComplete = /complete/.test(label) || /(equilibrata).*(mod|difesa)/.test(label);
     const mode = isComplete ? "complete" :
@@ -339,6 +404,7 @@ app.post("/webhook/kofi", async (req, res) => {
     const seed = crypto.randomUUID();
 
     if (mode === "complete") {
+      // genera le due rose con diversità
       const one = pickTeam(players, "equilibrata", seed);
       let two;
       for (let i=0;i<CFG.maxTries;i++){
@@ -349,7 +415,10 @@ app.post("/webhook/kofi", async (req, res) => {
         const uniq = 25;
         if (inter/uniq <= 0.4) { two = tmp; break; }
       }
-      if (!two) throw new Error("Impossibile garantire diversità >=60%");
+      if (!two) {
+        // fallback: usa cheapest per la seconda se proprio non riesce
+        two = pickFallbackCheapest(players, crypto.randomUUID());
+      }
 
       const [pdf1, pdf2] = await Promise.all([
         renderPdf({ mode: "equilibrata", payload: one }),
@@ -367,7 +436,16 @@ app.post("/webhook/kofi", async (req, res) => {
         [{ filename:"FantaElite_Rose.zip", content: zipBuf }]
       );
     } else {
-      const out = pickTeam(players, mode, seed);
+      let out;
+      try {
+        out = pickTeam(players, mode, seed);
+      } catch {
+        try {
+          out = pickTeam(players, mode, seed, CFG.budgetMin, Math.max(540, CFG.budgetMax));
+        } catch {
+          out = pickFallbackCheapest(players, seed);
+        }
+      }
       const pdf = await renderPdf({ mode, payload: out });
       await sendEmail(email,
         `FantaElite — La tua rosa (${mode === "equilibrata"?"Equilibrata":"Mod. Difesa"})`,
@@ -382,47 +460,7 @@ app.post("/webhook/kofi", async (req, res) => {
     res.status(500).json({ ok:false, error: e.message });
   }
 });
-app.get("/debug/dataset", async (req, res) => {
-  try {
-    const players = await readPlayers();
-    const byR = { P:[], D:[], C:[], A:[] };
-    players.forEach(p => { if (byR[p.Ruolo]) byR[p.Ruolo].push(p); });
-    const stat = (arr) => {
-      if (!arr.length) return { count:0, min:0, p25:0, median:0, p75:0, max:0 };
-      const prices = arr.map(x=>x.Quotazione||0).sort((a,b)=>a-b);
-      const q = (k)=> prices[Math.floor(k*(prices.length-1))] || 0;
-      return {
-        count: arr.length,
-        min: prices[0],
-        p25: q(0.25),
-        median: q(0.5),
-        p75: q(0.75),
-        max: prices[prices.length-1]
-      };
-    };
-    res.json({
-      totals: { all: players.length, P: byR.P.length, D: byR.D.length, C: byR.C.length, A: byR.A.length },
-      priceStats: { P: stat(byR.P), D: stat(byR.D), C: stat(byR.C), A: stat(byR.A) }
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-// Mostra cosa sto leggendo dallo Sheet (prime 10 righe parse) + conteggi per ruolo
-app.get("/debug/dataset", async (req, res) => {
-  try {
-    const players = await readPlayers();
-    const byR = { P:0, D:0, C:0, A:0 };
-    players.forEach(p => { if (byR[p.Ruolo] != null) byR[p.Ruolo]++; });
-    res.json({
-      count: players.length,
-      byRole: byR,
-      sample: players.slice(0, 10)
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+
 // === Avvio server ===
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, ()=> console.log("FantaElite backend avviato su porta", PORT));
