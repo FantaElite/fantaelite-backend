@@ -408,6 +408,21 @@ app.get("/debug/dataset", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+// Mostra cosa sto leggendo dallo Sheet (prime 10 righe parse) + conteggi per ruolo
+app.get("/debug/dataset", async (req, res) => {
+  try {
+    const players = await readPlayers();
+    const byR = { P:0, D:0, C:0, A:0 };
+    players.forEach(p => { if (byR[p.Ruolo] != null) byR[p.Ruolo]++; });
+    res.json({
+      count: players.length,
+      byRole: byR,
+      sample: players.slice(0, 10)
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 // === Avvio server ===
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, ()=> console.log("FantaElite backend avviato su porta", PORT));
