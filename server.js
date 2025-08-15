@@ -354,7 +354,32 @@ app.post("/webhook/kofi", async (req, res) => {
     res.status(500).json({ ok:false, error: e.message });
   }
 });
-
+app.get("/debug/dataset", async (req, res) => {
+  try {
+    const players = await readPlayers();
+    const byR = { P:[], D:[], C:[], A:[] };
+    players.forEach(p => { if (byR[p.Ruolo]) byR[p.Ruolo].push(p); });
+    const stat = (arr) => {
+      if (!arr.length) return { count:0, min:0, p25:0, median:0, p75:0, max:0 };
+      const prices = arr.map(x=>x.Quotazione||0).sort((a,b)=>a-b);
+      const q = (k)=> prices[Math.floor(k*(prices.length-1))] || 0;
+      return {
+        count: arr.length,
+        min: prices[0],
+        p25: q(0.25),
+        median: q(0.5),
+        p75: q(0.75),
+        max: prices[prices.length-1]
+      };
+    };
+    res.json({
+      totals: { all: players.length, P: byR.P.length, D: byR.D.length, C: byR.C.length, A: byR.A.length },
+      priceStats: { P: stat(byR.P), D: stat(byR.D), C: stat(byR.C), A: stat(byR.A) }
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 // === Avvio server ===
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, ()=> console.log("FantaElite backend avviato su porta", PORT));
