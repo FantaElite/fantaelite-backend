@@ -280,6 +280,14 @@ app.post("/api/test-generate", async (req,res)=>{
     res.json({ ok:true });
   }catch(e){ res.status(500).json({ error:e.message }); }
 });
+// Home (solo info)
+app.get("/", (req, res) => {
+  res.type("text/plain").send("FantaElite backend: online ✅\n- POST /api/test-generate\n- POST /webhook/kofi");
+});
 
+// Health check (per te o Render)
+app.get("/health", (req, res) => {
+  res.json({ ok: true, service: "fantaelite-backend", time: new Date().toISOString() });
+});
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, ()=> console.log("FantaElite backend avviato su porta", PORT));
