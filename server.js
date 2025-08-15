@@ -85,13 +85,12 @@ function sum(arr){ return arr.reduce((s,p)=>s+(p.Quotazione||0),0); }
 function hashSeed(s){ return [...Buffer.from(s)].reduce((a,b)=>((a<<5)-a+b)>>>0, 2166136261); }
 function mulberry32(a){ return function(){ let t=a+=0x6D2B79F5; t=Math.imul(t^t>>>15,t|1); t^=t+Math.imul(t^t>>>7,t|61); return ((t^t>>>14)>>>0)/4294967296; } }
 
-// === Algoritmo rosa con pool ampliato e tolleranza a scalini ===
 function pickTeam(players, mode, seed = crypto.randomUUID(), budgetMin = CFG.budgetMin, budgetMax = CFG.budgetMax) {
   const rng = mulberry32(hashSeed(seed));
   const byRole = { P:[], D:[], C:[], A:[] };
   players.forEach(p => { if (byRole[p.Ruolo]) byRole[p.Ruolo].push(p); });
 
-  // ordina per priorità: Partite_Voto, Fantamedia, Quotazione
+  // Ordina per priorità: Partite_Voto, Fantamedia, Quotazione
   Object.values(byRole).forEach(arr =>
     arr.sort((a,b) =>
       (b.Partite_Voto - a.Partite_Voto) ||
@@ -100,13 +99,38 @@ function pickTeam(players, mode, seed = crypto.randomUUID(), budgetMin = CFG.bud
     )
   );
 
+  // Traccia il miglior candidato anche se non perfetto
+  let best = null;
+  let bestScore = Infinity;
+
+  const scoreCandidate = (team, total, pctSpent) => {
+    // Penalità budget: distanza dal range
+    let budgetPenalty = 0;
+    if (total < budgetMin) budgetPenalty = (budgetMin - total);
+    else if (total > budgetMax) budgetPenalty = (total - budgetMax);
+
+    // Penalità percentuali: distanza fuori dai range base (più è fuori, peggio è)
+    const base = CFG.pct[mode];
+    const pctPenalty = ["P","D","C","A"].reduce((acc, r) => {
+      const lo = base[r][0], hi = base[r][1];
+      const v = pctSpent[r];
+      if (v < lo) return acc + (lo - v) * 1000;  // pesi alti per rispetto % ruolo
+      if (v > hi) return acc + (v - hi) * 1000;
+      return acc;
+    }, 0);
+
+    // Penalità squilibri interni (facoltativo: somma varianza)
+    const balancePenalty = Math.abs(pctSpent.P - base.P[0]) + Math.abs(pctSpent.D - base.D[0]) + Math.abs(pctSpent.C - base.C[0]) + Math.abs(pctSpent.A - base.A[0]);
+
+    return budgetPenalty * 10 + pctPenalty + balancePenalty; // mix di pesi
+  };
+
   for (let t=0; t<CFG.maxTries; t++) {
     const team = { P:[], D:[], C:[], A:[] };
 
     ["P","D","C","A"].forEach(R=>{
       const need = CFG.rolesCount[R];
-      // pool ampliato a 120
-      let pool = byRole[R].slice(0, Math.min(120, byRole[R].length));
+      let pool = byRole[R].slice(0, Math.min(120, byRole[R].length)); // pool 120
       while (team[R].length < need && pool.length) {
         const i = Math.floor(rng()*pool.length);
         team[R].push(pool.splice(i,1)[0]);
@@ -117,32 +141,36 @@ function pickTeam(players, mode, seed = crypto.randomUUID(), budgetMin = CFG.bud
     if (flat.length !== 25) continue;
 
     const total = flat.reduce((s,p)=>s+(p.Quotazione||0),0);
-    if (total < budgetMin || total > budgetMax) continue;
-
     const pctSpent = {
       P: sum(team.P)/total, D: sum(team.D)/total,
       C: sum(team.C)/total, A: sum(team.A)/total
     };
 
-    // controllo percentuali per ruolo con tolleranza a scalini
+    // 1) Prova range stretti
     const base = CFG.pct[mode];
-    if (!base) throw new Error("Modalità non riconosciuta");
     const within = (r, tilt=0) => {
       const lo = Math.max(0, base[r][0] - tilt);
       const hi = Math.min(1, base[r][1] + tilt);
       return pctSpent[r] >= lo && pctSpent[r] <= hi;
     };
-
     const okStrict   = ["P","D","C","A"].every(r => within(r, 0));
     const okSoft02   = ["P","D","C","A"].every(r => within(r, 0.02));
     const okSoft05   = ["P","D","C","A"].every(r => within(r, 0.05));
 
-    if (okStrict || okSoft02 || okSoft05) {
-      return { team, total, pctSpent, seed };
+    if (total >= budgetMin && total <= budgetMax && (okStrict || okSoft02 || okSoft05)) {
+      return { team, total, pctSpent, seed }; // trovato valido → esci
     }
+
+    // 2) Aggiorna best candidate
+    const s = scoreCandidate(team, total, pctSpent);
+    if (s < bestScore) { bestScore = s; best = { team, total, pctSpent, seed }; }
   }
 
-  throw new Error("Impossibile generare la rosa entro i tentativi massimi");
+  // 3) Fallback: restituisci il migliore trovato (mai errore)
+  if (best) return best;
+
+  // Estremo: nessun candidato (dataset vuoto)
+  throw new Error("Impossibile generare la rosa: dataset insufficiente");
 }
 
 // === PDF (pdfkit) ===
