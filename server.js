@@ -1,3 +1,4 @@
+import 'dotenv/config';
 // server.js (ESM)
 import express from 'express';
 import cors from 'cors';
