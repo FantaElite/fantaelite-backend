@@ -10,7 +10,7 @@
 //   PORT=3000
 //   PUBLIC_URL=http://localhost:3000
 //   API_KEY=abc123!fantaElite2025      (chiave interna per test/manuale)
-//   OPENAI_API_KEY=sk-...              (chiave standard) OPPURE sk-proj-...
+//   OPENAI_API_KEY=sk-proj...              (chiave standard) OPPURE sk-proj-...
 //   OPENAI_MODEL=gpt-4o-mini
 //   OPENAI_PROJECT=prj_xxx             (se usi sk-proj-... serve questo header)
 //   KOFI_VERIFICATION_TOKEN=...        (opzionale; webhook non obbligatorio qui)
