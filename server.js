@@ -1,504 +1,497 @@
-import express from "express";
-import crypto from "crypto";
-import JSZip from "jszip";
-import nodemailer from "nodemailer";
-import PDFDocument from "pdfkit";
-import { google } from "googleapis";
+// server.js — Flusso con Carrd + Ko-fi:
+// Ko-fi pagamento → webhook /webhooks/kofi → invio email con link /success?ticket=...
+// → pagina Successo mostra modulo → POST /api/generate (con ticket) → PDF + email
+//
+// Requisiti: Node 18+
+// 1) npm i
+// 2) Imposta le variabili d'ambiente (a fondo file)
+// 3) node server.js → usa Carrd per il pagamento; Ko-fi chiamerà il webhook
 
-const app = express();
-// Accetta JSON e anche form-urlencoded (Ko-fi può mandare form)
-app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: true, limit: "1mb" }));
+import 'dotenv/config';
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import express from 'express';
+import cors from 'cors';
+import morgan from 'morgan';
+import rateLimit from 'express-rate-limit';
+import { z } from 'zod';
+import PDFDocument from 'pdfkit';
+import OpenAI from 'openai';
+import { Resend } from 'resend';
 
-// === ENV ===
+// ========== ENV ==========
 const {
-  API_KEY, KOFI_WEBHOOK_SECRET, KOFI_API_KEY,
-  SHEET_ID, GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY,
-  MAIL_FROM, MAIL_USER, MAIL_PASS, SMTP_HOST, SMTP_PORT
+  PORT = '3000',
+  PUBLIC_URL = 'http://localhost:3000',
+
+  // protezione test/uso interno
+  API_KEY = 'change-me',
+
+  // OpenAI
+  OPENAI_API_KEY = '',
+  OPENAI_MODEL = 'gpt-4o-mini',
+
+  // Email via Resend (opzionale ma consigliato)
+  RESEND_API_KEY = '',
+  FROM_EMAIL = '', // es: "FantaElite <noreply@tuodominio.it>"
+
+  // Ko-fi Webhook
+  KOFI_VERIFICATION_TOKEN = '', // DEVE combaciare con quello impostato su Ko-fi
 } = process.env;
 
-// === SMTP ===
-const transporter = nodemailer.createTransport({
-  host: SMTP_HOST || "smtp.gmail.com",
-  port: Number(SMTP_PORT || 465),
-  secure: true,
-  auth: { user: MAIL_USER, pass: MAIL_PASS }
+// ========== APP ==========
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '1mb' }));
+app.use(morgan('tiny'));
+
+// ========== RATE LIMIT ==========
+const limiter = rateLimit({ windowMs: 60_000, max: 30 });
+app.use('/api/', limiter);
+app.use('/webhooks/', limiter);
+
+// ========== INTEGRAZIONI ==========
+const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
+
+// ========== PERSISTENZA SEMPLICE SU FILE ==========
+const DATA_DIR = path.join(process.cwd(), 'data');
+const STORE_FILE = path.join(DATA_DIR, 'store.json');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
+if (!fs.existsSync(STORE_FILE)) fs.writeFileSync(STORE_FILE, JSON.stringify({ tickets: {}, transactions: {}, emails: {} }, null, 2));
+
+function loadStore() {
+  try { return JSON.parse(fs.readFileSync(STORE_FILE, 'utf8')); }
+  catch { return { tickets: {}, transactions: {}, emails: {} }; }
+}
+function saveStore(store) {
+  fs.writeFileSync(STORE_FILE, JSON.stringify(store, null, 2));
+}
+
+// ========== UTILS TICKET ==========
+function newId() { return crypto.randomBytes(16).toString('hex'); }
+function now() { return Date.now(); }
+const TICKET_TTL_MS = 1000 * 60 * 60 * 72; // 72h
+
+function createTicketForEmail(email) {
+  const store = loadStore();
+  const id = newId();
+  store.tickets[id] = {
+    id,
+    email,
+    createdAt: now(),
+    expiresAt: now() + TICKET_TTL_MS,
+    used: false
+  };
+  if (!store.emails[email]) store.emails[email] = [];
+  store.emails[email].push(id);
+  saveStore(store);
+  return id;
+}
+function markTicketUsed(id) {
+  const store = loadStore();
+  if (store.tickets[id]) {
+    store.tickets[id].used = true;
+    saveStore(store);
+  }
+}
+function isTicketValid(id) {
+  const store = loadStore();
+  const t = store.tickets[id];
+  if (!t) return { ok: false, reason: 'not_found' };
+  if (t.used) return { ok: false, reason: 'used' };
+  if (t.expiresAt < now()) return { ok: false, reason: 'expired' };
+  return { ok: true, email: t.email };
+}
+function rememberTransaction(txId, email, ticketId) {
+  const store = loadStore();
+  store.transactions[txId] = { email, ticketId, at: now() };
+  saveStore(store);
+}
+
+// ========== HEALTH ==========
+app.get('/health', (req, res) => {
+  res.json({ ok: true, uptime: process.uptime() });
 });
 
-// === Google Sheets client (Service Account) ===
-const auth = new google.auth.JWT(
-  GOOGLE_SERVICE_ACCOUNT_EMAIL,
-  undefined,
-  (GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
-  ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-);
-const sheets = google.sheets({ version: "v4", auth });
+// ========== HOME SEMPLICE (INFO) ==========
+app.get('/', (req, res) => {
+  res.type('html').send(`
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FantaElite — Backend</title>
+<style>body{font-family:system-ui;max-width:800px;margin:40px auto;padding:0 16px;color:#111}.card{border:1px solid #eee;padding:16px;border-radius:12px}</style>
+</head>
+<body>
+<h1>FantaElite — Backend</h1>
+<div class="card">
+  <p>Landing su <strong>Carrd</strong>, pagamento su <strong>Ko-fi</strong>.</p>
+  <p>Configura su Ko-fi il <strong>Webhook</strong> verso <code>${PUBLIC_URL}/webhooks/kofi</code> con il tuo <em>Verification Token</em>.</p>
+  <p>Dopo il pagamento, invieremo una mail al cliente con il link a <code>/success?ticket=...</code>.</p>
+</div>
+</body></html>
+`);
+});
 
-// === Normalizzatori e mapping ruoli ===
-function toNum(v) {
-  if (v == null || v === "") return 0;
-  const s = String(v).trim();
+// ========== PAGINA SUCCESS (mostra MODULO) ==========
+app.get('/success', (req, res) => {
+  res.type('html').send(`
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Genera la tua rosa</title>
+<style>
+  body{font-family:system-ui;max-width:900px;margin:40px auto;padding:0 16px;color:#111}
+  .card{border:1px solid #eee;border-radius:12px;padding:16px;margin:16px 0;box-shadow:0 1px 8px rgba(0,0,0,.04)}
+  label{display:block;margin:8px 0 4px}
+  input,select{width:100%;padding:10px;border:1px solid #ddd;border-radius:8px}
+  button{padding:12px 16px;border:0;border-radius:10px;background:#111;color:#fff;cursor:pointer}
+  .muted{color:#666;font-size:14px}
+  .ok{color:green}.err{color:#b00}
+</style>
+</head>
+<body>
+  <h1>Genera la tua rosa</h1>
+  <p class="muted" id="status">Verifico il tuo ticket...</p>
 
-  // Gestione locale:
-  // "1.234,56" -> it    (punti migliaia, virgola decimale)
-  // "1,234.56" -> en    (virgola migliaia, punto decimale)
-  // "6,75"     -> it
-  // "6.75"     -> en
-  // "375"      -> intero
-  let t = s;
-  if (/^\d{1,3}(\.\d{3})+,\d+$/.test(s)) {        // 1.234,56
-    t = s.replace(/\./g, "").replace(",", ".");
-  } else if (/^\d{1,3}(,\d{3})+\.\d+$/.test(s)) { // 1,234.56
-    t = s.replace(/,/g, "");
-  } else if (s.includes(",") && !s.includes(".")) { // 6,75
-    t = s.replace(",", ".");
-  } else { // 6.75 o 375 o "1,234"
-    t = s.replace(/,/g, ""); // rimuovi virgole come migliaia
-  }
-  const n = Number(t);
-  return Number.isFinite(n) ? n : 0;
-}
-function cleanStr(s){ return String(s || "").trim(); }
+  <div class="card" id="formCard" style="display:none">
+    <form id="genForm">
+      <label>Modalità</label>
+      <select name="mode">
+        <option value="equilibrata">Equilibrata</option>
+        <option value="aggressiva">Aggressiva</option>
+        <option value="lowcost">Low Cost</option>
+      </select>
+      <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px">
+        <div>
+          <label>Budget Min</label>
+          <input name="budgetMin" type="number" value="380" min="1" />
+        </div>
+        <div>
+          <label>Budget Max</label>
+          <input name="budgetMax" type="number" value="520" min="1" />
+        </div>
+      </div>
+      <label>Email per ricevere il PDF</label>
+      <input name="email" type="email" placeholder="tu@esempio.it" required />
+      <div style="margin-top:12px"><button type="submit">Genera e scarica PDF</button></div>
+    </form>
+    <p id="msg" class="muted"></p>
+  </div>
 
-// Mappa ruoli scritti per esteso/variazioni → P/D/C/A
-function mapRole(raw){
-  const x = cleanStr(raw).toLowerCase();
-
-  if (x === "p" || x.includes("port")) return "P"; // Portiere, Port., Por
-  if (x === "d" || x.includes("dif")) return "D";  // Difensore, Dif., DC/DS/TD/TS
-  if (x === "c" || x.includes("centro") || x.includes("med")) return "C"; // Centrocampista, Mediano
-  if (x === "a" || x.includes("att") || x.includes("punta") || x.includes("ala") || x.includes("est")) return "A"; // Attaccante, Punta, Ala, Esterno
-
-  // fallback con iniziale/parola
-  if (/^port/.test(x)) return "P";
-  if (/^dif/.test(x))  return "D";
-  if (/^centro|^med/.test(x)) return "C";
-  if (/^att|^punta|^ala|^est/.test(x)) return "A";
-
-  return ""; // sconosciuto → scarto
-}
-
-// === Lettura robusta da Google Sheets (cache 10 min) ===
-let CACHE = { at: 0, rows: [] };
-
-async function readPlayers() {
-  const now = Date.now();
-  if (now - CACHE.at < 10 * 60 * 1000 && CACHE.rows.length) return CACHE.rows;
-
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: "Database Fantacalcio!A:Z" // range largo, ordine colonne libero
-  });
-
-  const values = res.data.values || [];
-  if (!values.length) { CACHE = { at: now, rows: [] }; return []; }
-
-  const [header, ...data] = values;
-  const H = header.map(h => cleanStr(h));
-  const canon = H.map(h => h.toLowerCase());
-
-  function findIdxBySynonyms(names) {
-    for (const raw of names) {
-      const name = raw.toLowerCase();
-      // match esatto (con varianti spazi/underscore)
-      let i = canon.findIndex(h =>
-        h === name ||
-        h === name.replace(/\s+/g,"_") ||
-        h === name.replace(/\s+/g,"")
-      );
-      if (i >= 0) return i;
-      // match parziale
-      i = canon.findIndex(h => h.includes(name));
-      if (i >= 0) return i;
+<script>
+(async () => {
+  const p = new URLSearchParams(location.search);
+  const ticket = p.get('ticket');
+  const statusEl = document.getElementById('status');
+  const card = document.getElementById('formCard');
+  if (!ticket) { statusEl.innerHTML = '<span class="err">Ticket mancante</span>'; return; }
+  try {
+    const r = await fetch('/api/verify-ticket?ticket='+encodeURIComponent(ticket));
+    const data = await r.json();
+    if (data.valid) {
+      statusEl.innerHTML = '<span class="ok">Ticket valido: compila il modulo qui sotto.</span>';
+      card.style.display = 'block';
+      const form = document.getElementById('genForm');
+      const msg = document.getElementById('msg');
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        msg.textContent = 'Genero la rosa...';
+        const fd = new FormData(form);
+        const payload = {
+          ticket,
+          mode: fd.get('mode'),
+          budgetMin: Number(fd.get('budgetMin')),
+          budgetMax: Number(fd.get('budgetMax')),
+          email: fd.get('email'),
+          demo: false
+        };
+        try {
+          const r = await fetch('/api/generate', {
+            method: 'POST',
+            headers: { 'Content-Type':'application/json' },
+            body: JSON.stringify(payload)
+          });
+          if (!r.ok) {
+            const t = await r.text();
+            msg.innerHTML = '<span class="err">Errore: '+t+'</span>';
+            return;
+          }
+          const blob = await r.blob();
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url; a.download = 'FantaElite_'+payload.mode+'.pdf';
+          document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+          msg.innerHTML = '<span class="ok">PDF scaricato. Se hai inserito l’email, lo riceverai anche via mail.</span>';
+        } catch (err) {
+          msg.innerHTML = '<span class="err">Errore di rete: '+err.message+'</span>';
+        }
+      });
+    } else {
+      statusEl.innerHTML = '<span class="err">Ticket non valido: '+(data.reason||'')+'</span>';
     }
-    return -1;
+  } catch (e) {
+    statusEl.innerHTML = '<span class="err">'+e.message+'</span>';
   }
+})();
+</script>
+</body>
+</html>
+`);
+});
 
-  const idx = {
-    Nome:         findIdxBySynonyms(["Nome","Giocatore","Player","Calciatore"]),
-    Squadra:      findIdxBySynonyms(["Squadra","Team","Club"]),
-    Ruolo:        findIdxBySynonyms(["Ruolo","Posizione","Role"]),
-    Media_Voto:   findIdxBySynonyms(["Media_Voto","Media Voto","Media","MV"]),
-    Fantamedia:   findIdxBySynonyms(["Fantamedia","Fanta Media","Fanta_media","FM"]),
-    Quotazione:   findIdxBySynonyms(["Quotazione","Quot.","Quot","Prezzo","Crediti","Valore","Costo","Price","Cost","Val."]),
-    Partite_Voto: findIdxBySynonyms(["Partite_Voto","Partite","Partite Voto","PV","Presenze","Giocate"])
-  };
+// ========== VERIFICA TICKET ==========
+app.get('/api/verify-ticket', (req, res) => {
+  const ticket = String(req.query.ticket || '');
+  if (!ticket) return res.json({ valid: false, reason: 'missing' });
+  const v = isTicketValid(ticket);
+  res.json({ valid: v.ok, reason: v.reason || null });
+});
 
-  // minimi indispensabili
-  if (idx.Nome < 0 || idx.Ruolo < 0 || idx.Quotazione < 0) {
-    throw new Error("Header mancanti: servono almeno Nome, Ruolo e (Quotazione/Prezzo/Crediti/Valore) nella riga 1 della linguetta 'Database Fantacalcio'.");
-  }
+// ========== WEBHOOK KO-FI ==========
+/*
+  Configura su Ko-fi:
+  - Webhook URL:      ${PUBLIC_URL}/webhooks/kofi
+  - Verification token: UGUALE a KOFI_VERIFICATION_TOKEN
+  Ko-fi invia un JSON che include (tra gli altri) "verification_token", "email", "kofi_transaction_id", "type".
+*/
+const KoFiSchema = z.object({
+  verification_token: z.string(),
+  email: z.string().email().optional(),
+  type: z.string().optional(), // Donation / Shop Order / Subscription Payment ecc.
+  message_id: z.string().optional(),
+  timestamp: z.string().optional(),
+  kofi_transaction_id: z.string().optional(),
+  amount: z.string().optional(),
+  currency: z.string().optional(),
+  from_name: z.string().optional(),
+  message: z.string().optional()
+});
 
-  const rows = data.map(r => {
-    const ruolo = mapRole(r[idx.Ruolo]);
-    return {
-      Nome: cleanStr(r[idx.Nome]),
-      Squadra: idx.Squadra >= 0 ? cleanStr(r[idx.Squadra]) : "",
-      Ruolo: ruolo,
-      Media_Voto: idx.Media_Voto >= 0 ? toNum(r[idx.Media_Voto]) : 0,
-      Fantamedia: idx.Fantamedia >= 0 ? toNum(r[idx.Fantamedia]) : 0,
-      Quotazione: toNum(r[idx.Quotazione]),
-      Partite_Voto: idx.Partite_Voto >= 0 ? toNum(r[idx.Partite_Voto]) : 0,
-    };
-  })
-  .filter(x => x.Nome && ["P","D","C","A"].includes(x.Ruolo) && Number.isFinite(x.Quotazione));
+app.post('/webhooks/kofi', (req, res) => {
+  try {
+    const payload = KoFiSchema.parse(req.body || {});
+    if (!KOFI_VERIFICATION_TOKEN) return res.status(400).send('Server non configurato (token mancante)');
+    if (payload.verification_token !== KOFI_VERIFICATION_TOKEN) {
+      return res.status(401).send('Token non valido');
+    }
+    const buyerEmail = payload.email;
+    const txId = payload.kofi_transaction_id || `kofi_${newId()}`;
 
-  CACHE = { at: now, rows };
-  return rows;
-}
+    // generiamo il ticket solo se abbiamo una email
+    if (buyerEmail) {
+      const ticket = createTicketForEmail(buyerEmail);
+      rememberTransaction(txId, buyerEmail, ticket);
 
-// === Config & util ===
-const CFG = {
-  budgetMin: 380,
-  budgetMax: 500,        // alza a 520 se i tuoi dati sono “costosi”
-  maxTries: 500,         // aumentato
-  rolesCount: { P: 3, D: 8, C: 8, A: 6 },
-  pct: {
-    equilibrata: { P:[0.04,0.08], D:[0.08,0.14], C:[0.20,0.30], A:[0.56,0.64] },
-    moddifesa:   { P:[0.08,0.10], D:[0.18,0.20], C:[0.30,0.32], A:[0.40,0.42] }
-  }
-};
-function sum(arr){ return arr.reduce((s,p)=>s+(p.Quotazione||0),0); }
-function hashSeed(s){ return [...Buffer.from(s)].reduce((a,b)=>((a<<5)-a+b)>>>0, 2166136261); }
-function mulberry32(a){ return function(){ let t=a+=0x6D2B79F5; t=Math.imul(t^t>>>15,t|1); t^=t+Math.imul(t^t>>>7,t|61); return ((t^t>>>14)>>>0)/4294967296; } }
-
-// === Algoritmo con pool 120, tolleranza a scalini ===
-function pickTeam(players, mode, seed = crypto.randomUUID(), budgetMin = CFG.budgetMin, budgetMax = CFG.budgetMax) {
-  const rng = mulberry32(hashSeed(seed));
-  const byRole = { P:[], D:[], C:[], A:[] };
-  players.forEach(p => { if (byRole[p.Ruolo]) byRole[p.Ruolo].push(p); });
-
-  // ordina per priorità: Partite_Voto, Fantamedia, Quotazione
-  Object.values(byRole).forEach(arr =>
-    arr.sort((a,b) =>
-      (b.Partite_Voto - a.Partite_Voto) ||
-      (b.Fantamedia - a.Fantamedia) ||
-      (b.Quotazione - a.Quotazione)
-    )
-  );
-
-  for (let t=0; t<CFG.maxTries; t++) {
-    const team = { P:[], D:[], C:[], A:[] };
-
-    ["P","D","C","A"].forEach(R=>{
-      const need = CFG.rolesCount[R];
-      // pool ampliato a 120
-      let pool = byRole[R].slice(0, Math.min(120, byRole[R].length));
-      while (team[R].length < need && pool.length) {
-        const i = Math.floor(rng()*pool.length);
-        team[R].push(pool.splice(i,1)[0]);
+      // inviamo mail con link a /success?ticket=...
+      if (resend && FROM_EMAIL) {
+        resend.emails.send({
+          from: FROM_EMAIL,
+          to: buyerEmail,
+          subject: "Il tuo accesso per generare la rosa — FantaElite",
+          text: `Grazie per il pagamento su Ko-fi!\n\nClicca qui per generare la tua rosa:\n${PUBLIC_URL}/success?ticket=${ticket}\n\nIl link scade tra 72 ore.`
+        }).catch(e => console.warn('Invio email (Ko-fi) fallito:', e?.message || e));
       }
-    });
-
-    const flat = [...team.P, ...team.D, ...team.C, ...team.A];
-    if (flat.length !== 25) continue;
-
-    const total = flat.reduce((s,p)=>s+(p.Quotazione||0),0);
-    if (total < budgetMin || total > budgetMax) continue;
-
-    const pctSpent = {
-      P: sum(team.P)/total, D: sum(team.D)/total,
-      C: sum(team.C)/total, A: sum(team.A)/total
-    };
-
-    // controllo percentuali per ruolo con tolleranza a scalini
-    const base = CFG.pct[mode];
-    if (!base) throw new Error("Modalità non riconosciuta");
-    const within = (r, tilt=0) => {
-      const lo = Math.max(0, base[r][0] - tilt);
-      const hi = Math.min(1, base[r][1] + tilt);
-      return pctSpent[r] >= lo && pctSpent[r] <= hi;
-    };
-
-    const okStrict   = ["P","D","C","A"].every(r => within(r, 0));
-    const okSoft02   = ["P","D","C","A"].every(r => within(r, 0.02));
-    const okSoft05   = ["P","D","C","A"].every(r => within(r, 0.05));
-
-    if (okStrict || okSoft02 || okSoft05) {
-      return { team, total, pctSpent, seed };
+    } else {
+      console.warn('Webhook Ko-fi ricevuto ma senza email; impossibile inviare ticket.');
     }
-  }
 
-  throw new Error("Impossibile generare la rosa entro i tentativi massimi");
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Errore webhook Ko-fi:', err?.message || err);
+    res.status(400).send('Bad Request');
+  }
+});
+
+// ========== VALIDAZIONE INPUT GENERAZIONE ==========
+const GenSchema = z.object({
+  mode: z.enum(['equilibrata','aggressiva','lowcost']),
+  email: z.string().email().optional(),
+  budgetMin: z.number().int().min(1),
+  budgetMax: z.number().int().min(1),
+  demo: z.boolean().optional(),
+  ticket: z.string().optional(), // via flusso Ko-fi
+  // alternativa test/uso interno
+  session_id: z.string().optional() // compatibilità vecchi client (ignorato qui)
+});
+
+// ========== OPENAI: suggerisci rosa ==========
+async function suggestRoster({ mode, budgetMin, budgetMax }) {
+  if (!OPENAI_API_KEY) {
+    // fallback statico per ambienti senza chiave
+    return {
+      P: ['Portiere A','Portiere B'],
+      D: ['Difensore A','Difensore B','Difensore C','Difensore D','Difensore E'],
+      C: ['Centrocampista A','Centrocampista B','Centrocampista C','Centrocampista D'],
+      A: ['Attaccante A','Attaccante B','Attaccante C']
+    };
+  }
+  const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+  const prompt = `
+Sei un consulente Fantacalcio. Proponi una rosa COMPATTA in formato JSON con proprietà P,D,C,A (array di stringhe),
+coerente con la strategia "${mode}" e budget indicativo min ${budgetMin} / max ${budgetMax}.
+Rispondi SOLO con JSON valido. Esempio:
+{"P":["...","..."],"D":["..."],"C":["..."],"A":["..."]}`;
+  const resp = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    temperature: 0.3,
+    messages: [
+      { role: 'system', content: 'Rispondi SOLO con JSON valido come da esempio.' },
+      { role: 'user', content: prompt }
+    ]
+  });
+  const text = resp.choices?.[0]?.message?.content?.trim() || '{}';
+  const start = text.indexOf('{'); const end = text.lastIndexOf('}');
+  const json = start >= 0 ? text.slice(start, end + 1) : '{}';
+  let parsed = {};
+  try { parsed = JSON.parse(json); } catch {}
+  return {
+    P: Array.isArray(parsed.P) && parsed.P.length ? parsed.P : ['Portiere A','Portiere B'],
+    D: Array.isArray(parsed.D) && parsed.D.length ? parsed.D : ['Dif A','Dif B','Dif C','Dif D','Dif E'],
+    C: Array.isArray(parsed.C) && parsed.C.length ? parsed.C : ['Cen A','Cen B','Cen C','Cen D'],
+    A: Array.isArray(parsed.A) && parsed.A.length ? parsed.A : ['Att A','Att B','Att C']
+  };
 }
 
-// === Fallback: sempre una rosa valida (i più economici per ruolo) ===
-function pickFallbackCheapest(players, seed = crypto.randomUUID()) {
-  const byRole = { P:[], D:[], C:[], A:[] };
-  players.forEach(p => { if (byRole[p.Ruolo]) byRole[p.Ruolo].push(p); });
-  const need = { P:3, D:8, C:8, A:6 };
+// ========== PDF ==========
+function generatePdfBuffer({ mode, email, budgetMin, budgetMax, roster, demo }) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: 'A4', margin: 40 });
+    const chunks = [];
+    doc.on('data', c => chunks.push(c));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
 
-  for (const r of ["P","D","C","A"]) {
-    byRole[r].sort((a,b) =>
-      (a.Quotazione - b.Quotazione) ||
-      (b.Fantamedia - a.Fantamedia) ||
-      (b.Partite_Voto - a.Partite_Voto)
-    );
-    if (byRole[r].length < need[r]) throw new Error(`Dataset insufficiente per ruolo ${r}`);
-  }
+    doc.fontSize(20).text(`FantaElite — Strategia: ${mode}`);
+    doc.moveDown(0.3).fontSize(10).fillColor('#555')
+      .text(`Budget: ${budgetMin}-${budgetMax}  |  Email: ${email || 'n/d'}  |  Data: ${new Date().toLocaleString('it-IT')}`);
+    doc.moveDown(0.8).fillColor('#000');
 
-  const team = {
-    P: byRole.P.slice(0, need.P),
-    D: byRole.D.slice(0, need.D),
-    C: byRole.C.slice(0, need.C),
-    A: byRole.A.slice(0, need.A),
-  };
-  const total = [...team.P, ...team.D, ...team.C, ...team.A].reduce((s,p)=>s+(p.Quotazione||0),0);
-  const pctSpent = {
-    P: team.P.reduce((s,p)=>s+(p.Quotazione||0),0) / (total||1),
-    D: team.D.reduce((s,p)=>s+(p.Quotazione||0),0) / (total||1),
-    C: team.C.reduce((s,p)=>s+(p.Quotazione||0),0) / (total||1),
-    A: team.A.reduce((s,p)=>s+(p.Quotazione||0),0) / (total||1),
-  };
-  return { team, total, pctSpent, seed, fallback: true };
-}
+    const section = (titolo, items) => {
+      doc.fontSize(16).text(titolo);
+      doc.moveDown(0.2).fontSize(12).fillColor('#333');
+      items.forEach(n => doc.text('• ' + n));
+      doc.moveDown(0.6).fillColor('#000');
+    };
+    section('P — Portieri', roster.P);
+    section('D — Difensori', roster.D);
+    section('C — Centrocampisti', roster.C);
+    section('A — Attaccanti', roster.A);
 
-// === PDF (pdfkit) ===
-function renderPdf({ mode, payload }) {
-  const { team, total, pctSpent, seed } = payload;
-  const doc = new PDFDocument({ size: "A4", margin: 40 });
-  const chunks = [];
-  doc.on("data", c => chunks.push(c));
-  return new Promise((resolve) => {
-    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.moveDown(0.5).fontSize(10).fillColor('#666')
+      .text('Nota: rosa generata automaticamente in base ai parametri. Adattala alla tua lega.');
 
-    // Header
-    doc.fontSize(18).text(`FantaElite — ${mode === "equilibrata" ? "Rosa Equilibrata" : "Modificatore Difesa"}`, { align:"left" });
-    doc.moveDown(0.5);
-    doc.fontSize(10).fillColor("#555").text(`Data: ${new Date().toLocaleString("it-IT")}`);
-    doc.text(`Seed: ${seed}`);
-    doc.moveDown();
-
-    // Tabella
-    drawTable(doc, team);
-
-    // Totali
-    doc.moveDown();
-    doc.fontSize(12).fillColor("#000").text(`Totale crediti: ${total}`);
-    doc.fontSize(10).fillColor("#333").text(`Spesa per ruolo: P ${(pctSpent.P*100).toFixed(1)}% • D ${(pctSpent.D*100).toFixed(1)}% • C ${(pctSpent.C*100).toFixed(1)}% • A ${(pctSpent.A*100).toFixed(1)}%`);
-    doc.moveDown(1);
-    doc.fontSize(8).fillColor("#666").text("Nota: rosa generata automaticamente in base a dati, budget e vincoli impostati.", { align:"left" });
+    if (demo) {
+      doc.rotate(35, { origin: [300, 400] })
+         .fontSize(58).fillColor('rgba(200,200,200,0.4)')
+         .text('DEMO', 80, 250, { align: 'center' })
+         .rotate(-35);
+    }
 
     doc.end();
   });
 }
-function drawTable(doc, team){
-  const rows = [
-    ["RUOLO","GIOCATORE","SQUADRA","FANTAM.","PARTITE","CREDITI"],
-    ...["P","D","C","A"].flatMap(R =>
-      team[R].map(p => [R, p.Nome, p.Squadra, fmt(p.Fantamedia), fmt(p.Partite_Voto), fmt(p.Quotazione)]))
-  ];
-  const colW = [50, 180, 100, 80, 70, 70];
-  let y = doc.y + 5, x = doc.x;
-  rows.forEach((r, idx) => {
-    const isHeader = idx === 0;
-    if (isHeader) doc.rect(x, y-3, colW.reduce((a,b)=>a+b,0), 22).fill("#f2f2f2").fillColor("#000");
-    r.forEach((cell, i) => {
-      doc.fontSize(isHeader?10:9).fillColor(isHeader?"#000":"#111")
-         .text(String(cell), x + colW.slice(0,i).reduce((a,b)=>a+b,0) + 6, y, { width: colW[i]-10 });
-    });
-    y += 20;
-    doc.moveTo(x, y-2).lineTo(x + colW.reduce((a,b)=>a+b,0), y-2).strokeColor("#e5e5e5").stroke();
-  });
-}
-function fmt(v){ return (v ?? 0).toString().replace(".", ","); }
 
-// === Email helper ===
-async function sendEmail(to, subject, text, attachments){
-  await transporter.sendMail({ from: MAIL_FROM, to, subject, text, attachments });
-}
-
-// === Home & Health ===
-app.get("/", (req, res) => {
-  res.type("text/plain").send("FantaElite backend: online ✅\n- POST /api/test-generate\n- POST /webhook/kofi");
-});
-app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "fantaelite-backend", time: new Date().toISOString() });
-});
-
-// === Debug: cosa c'è nel dataset ===
-app.get("/debug/dataset", async (req, res) => {
+// ========== API: GENERATE ==========
+app.post('/api/generate', async (req, res) => {
   try {
-    const players = await readPlayers();
-    const byR = { P:0, D:0, C:0, A:0 };
-    players.forEach(p => { if (byR[p.Ruolo] != null) byR[p.Ruolo]++; });
-
-    const prices = players.map(p => p.Quotazione || 0).filter(Number.isFinite).sort((a,b)=>a-b);
-    const q = (k)=> prices.length ? prices[Math.floor(k*(prices.length-1))] : 0;
-
-    res.json({
-      count: players.length,
-      byRole: byR,
-      priceStats: { min: prices[0]||0, p25: q(0.25), median: q(0.5), p75: q(0.75), max: prices[prices.length-1]||0 },
-      sample: players.slice(0, 5)
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// === Test solo email (utile per debug SMTP) ===
-app.post("/api/test-email", async (req, res) => {
-  try {
-    if (req.headers.authorization !== `Bearer ${API_KEY}`) return res.status(401).end();
-    const to = (req.query.to || "tua_email@esempio.it").toString();
-    await transporter.sendMail({
-      from: MAIL_FROM,
-      to,
-      subject: "FantaElite — Test email",
-      text: "Se ricevi questa, l'SMTP è OK 👍"
-    });
-    res.json({ ok: true, sent: to });
-  } catch (e) {
-    console.error("TEST-EMAIL ERROR:", e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// === Test generate (manuale) ===
-// 3 livelli: normale → budgetMax allargato → fallback cheapest
-app.post("/api/test-generate", async (req,res)=>{
-  try{
-    if (req.headers.authorization !== `Bearer ${API_KEY}`) return res.status(401).end();
-    const { mode="equilibrata", email, budgetMin, budgetMax } = req.body || {};
-    if (!email) return res.status(400).json({ error:"email richiesta" });
-
-    const players = await readPlayers();
-    const seed = crypto.randomUUID();
-
-    const doOne = async (m) => {
-      try {
-        // 1° tentativo: vincoli normali (con eventuale budget custom dal body)
-        const out = pickTeam(players, m, seed, budgetMin || CFG.budgetMin, budgetMax || CFG.budgetMax);
-        const pdf = await renderPdf({ mode: m, payload: out });
-        await sendEmail(email,
-          `FantaElite — La tua rosa (${m==="equilibrata"?"Equilibrata":"Mod. Difesa"})`,
-          "Grazie per l'acquisto! In allegato trovi il PDF della tua rosa.",
-          [{ filename:`FantaElite_${m==="equilibrata"?"Equilibrata":"ModDifesa"}.pdf`, content: pdf }]
-        );
-      } catch {
-        try {
-          // 2° tentativo: allargo budget
-          const out2 = pickTeam(players, m, seed, (budgetMin||CFG.budgetMin), Math.max(540, budgetMax||CFG.budgetMax));
-          const pdf2 = await renderPdf({ mode: m, payload: out2 });
-          await sendEmail(email,
-            `FantaElite — La tua rosa (${m==="equilibrata"?"Equilibrata":"Mod. Difesa"})`,
-            "Nota: vincoli allargati per garantire la generazione della rosa.",
-            [{ filename:`FantaElite_${m==="equilibrata"?"Equilibrata":"ModDifesa"}.pdf`, content: pdf2 }]
-          );
-        } catch {
-          // 3° tentativo: fallback cheapest
-          const out3 = pickFallbackCheapest(players, seed);
-          const pdf3 = await renderPdf({ mode: m, payload: out3 });
-          await sendEmail(email,
-            `FantaElite — La tua rosa (${m==="equilibrata"?"Equilibrata":"Mod. Difesa"})`,
-            "Nota: generazione in modalità di sicurezza (rosa più economica per ruolo).",
-            [{ filename:`FantaElite_${m==="equilibrata"?"Equilibrata":"ModDifesa"}.pdf`, content: pdf3 }]
-          );
-        }
-      }
+    const clean = {
+      ...req.body,
+      budgetMin: Number(req.body?.budgetMin),
+      budgetMax: Number(req.body?.budgetMax),
+      demo: Boolean(req.body?.demo)
     };
-
-    if (mode === "complete"){
-      await doOne("equilibrata");
-      await doOne("moddifesa");
-      return res.json({ ok:true, note:"invio doppio effettuato (due email separate in test)" });
-    } else {
-      await doOne(mode);
-      return res.json({ ok:true });
+    const p = GenSchema.parse(clean);
+    if (p.budgetMax < p.budgetMin) {
+      return res.status(400).json({ error: 'budgetMax deve essere >= budgetMin' });
     }
-  }catch(e){
-    console.error(e);
-    res.status(500).json({ error:e.message });
+
+    // Autorizzazione:
+    // A) flusso Ko-fi: ticket valido
+    // B) test interno: Authorization: Bearer <API_KEY>
+    let authorized = false;
+    let emailFromTicket = null;
+
+    const auth = req.header('Authorization') || '';
+    if (auth === `Bearer ${API_KEY}`) {
+      authorized = true;
+    } else if (p.ticket) {
+      const v = isTicketValid(p.ticket);
+      if (v.ok) {
+        authorized = true;
+        emailFromTicket = v.email;
+        // opzionale: consumare il ticket ad ogni generazione:
+        markTicketUsed(p.ticket);
+      }
+    }
+
+    if (!authorized) {
+      return res.status(401).json({ error: 'Non autorizzato (servono ticket valido o API_KEY)' });
+    }
+
+    const roster = await suggestRoster(p);
+    const pdfBuffer = await generatePdfBuffer({
+      ...p,
+      email: p.email || emailFromTicket || null,
+      roster
+    });
+
+    // Email (se configurato) — mandiamo solo se abbiamo una mail
+    const sendTo = p.email || emailFromTicket;
+    if (resend && FROM_EMAIL && sendTo) {
+      resend.emails.send({
+        from: FROM_EMAIL,
+        to: sendTo,
+        subject: `La tua rosa FantaElite — ${p.mode}`,
+        text: `In allegato trovi il PDF della tua rosa.\n\nStrategia: ${p.mode}\nBudget: ${p.budgetMin}-${p.budgetMax}\n\nBuon Fantacalcio!`,
+        attachments: [{
+          filename: `FantaElite_${p.mode}.pdf`,
+          content: pdfBuffer.toString('base64')
+        }]
+      }).catch(e => console.warn('Invio email fallito:', e?.message || e));
+    }
+
+    // Risposta (download)
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="FantaElite_${p.mode}.pdf"`);
+    res.end(pdfBuffer);
+
+  } catch (err) {
+    if (err?.issues) {
+      return res.status(400).json({ error: 'Parametri non validi', details: err.issues });
+    }
+    console.error('Errore /api/generate:', err);
+    res.status(500).send('Errore interno durante la generazione');
   }
 });
 
-// === Webhook Ko-fi ===
-app.post("/webhook/kofi", async (req, res) => {
-  try {
-    // Firma: per i primi test puoi lasciare vuoto KOFI_WEBHOOK_SECRET
-    const provided = (req.headers["x-ko-fi-signature"] || req.headers["x-kofi-signature"] || "").toString();
-    if (KOFI_WEBHOOK_SECRET && provided !== KOFI_WEBHOOK_SECRET) {
-      return res.status(401).json({ ok:false, error:"Firma non valida" });
-    }
-
-    const ev = req.body || {};
-    const email = (ev.email || ev.payer_email || ev.from || "").toString().trim().toLowerCase();
-    if (!email) return res.status(400).json({ ok:false, error:"Email mancante nel webhook" });
-
-    const label = [ev.item, ev.tier, ev.shop_item, ev.message].filter(Boolean).join(" ").toLowerCase();
-    const isComplete = /complete/.test(label) || /(equilibrata).*(mod|difesa)/.test(label);
-    const mode = isComplete ? "complete" :
-                 /equilibrata/.test(label) ? "equilibrata" :
-                 /(mod|difesa)/.test(label) ? "moddifesa" : null;
-    if (!mode) return res.status(400).json({ ok:false, error:"Prodotto non riconosciuto" });
-
-    const players = await readPlayers();
-    const seed = crypto.randomUUID();
-
-    if (mode === "complete") {
-      let one, two;
-      try {
-        one = pickTeam(players, "equilibrata", seed);
-      } catch {
-        one = pickFallbackCheapest(players, seed);
-      }
-      try {
-        // prova a generare una seconda rosa diversa
-        for (let i=0;i<CFG.maxTries;i++){
-          const tmp = pickTeam(players, "moddifesa", crypto.randomUUID());
-          const overlap = new Set([...one.team.P, ...one.team.D, ...one.team.C, ...one.team.A].map(p=>p.Nome));
-          const twoFlat = [...tmp.team.P,...tmp.team.D,...tmp.team.C,...tmp.team.A].map(p=>p.Nome);
-          const inter = twoFlat.filter(n=>overlap.has(n)).length;
-          const uniq = 25;
-          if (inter/uniq <= 0.4) { two = tmp; break; }
-        }
-        if (!two) two = pickTeam(players, "moddifesa", crypto.randomUUID(), CFG.budgetMin, Math.max(540, CFG.budgetMax));
-      } catch {
-        two = pickFallbackCheapest(players, crypto.randomUUID());
-      }
-
-      const [pdf1, pdf2] = await Promise.all([
-        renderPdf({ mode: "equilibrata", payload: one }),
-        renderPdf({ mode: "moddifesa",   payload: two })
-      ]);
-
-      const zip = new JSZip();
-      zip.file(`FantaElite_Equilibrata.pdf`, pdf1);
-      zip.file(`FantaElite_ModDifesa.pdf`, pdf2);
-      const zipBuf = await zip.generateAsync({ type: "nodebuffer" });
-
-      await sendEmail(email,
-        "FantaElite — Le tue rose (Equilibrata + Mod. Difesa)",
-        "Grazie per l'acquisto! In allegato trovi i PDF delle due rose.",
-        [{ filename:"FantaElite_Rose.zip", content: zipBuf }]
-      );
-    } else {
-      let out;
-      try {
-        out = pickTeam(players, mode, seed);
-      } catch {
-        try {
-          out = pickTeam(players, mode, seed, CFG.budgetMin, Math.max(540, CFG.budgetMax));
-        } catch {
-          out = pickFallbackCheapest(players, seed);
-        }
-      }
-      const pdf = await renderPdf({ mode, payload: out });
-      await sendEmail(email,
-        `FantaElite — La tua rosa (${mode === "equilibrata"?"Equilibrata":"Mod. Difesa"})`,
-        "Grazie per l'acquisto! In allegato trovi il PDF della tua rosa.",
-        [{ filename:`FantaElite_${mode==="equilibrata"?"Equilibrata":"ModDifesa"}.pdf`, content: pdf }]
-      );
-    }
-
-    res.json({ ok:true });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok:false, error: e.message });
-  }
+// ========== START ==========
+app.listen(Number(PORT), () => {
+  console.log(`✅ Backend pronto su ${PUBLIC_URL} (porta ${PORT})`);
+  if (!KOFI_VERIFICATION_TOKEN) console.log('⚠️  KOFI_VERIFICATION_TOKEN mancante: configura il webhook su Ko-fi.');
+  if (!OPENAI_API_KEY) console.log('⚠️  OPENAI_API_KEY mancante: userò roster di fallback statico.');
+  if (RESEND_API_KEY && !FROM_EMAIL) console.log('⚠️  RESEND_API_KEY presente ma FROM_EMAIL mancante: email disabilitata.');
 });
 
-// === Avvio server ===
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, ()=> console.log("FantaElite backend avviato su porta", PORT));
+/*
+===========================
+ Variabili d'ambiente (PowerShell)
+===========================
+$env:PORT="3000"
+$env:PUBLIC_URL="http://localhost:3000"
+$env:API_KEY="abc123!fantaElite2025"
+
+# OpenAI
+$env:OPENAI_API_KEY="LA_TUA_CHIAVE_OPENAI"
+$env:OPENAI_MODEL="gpt-4o-mini"
+
+# Resend (email) — opzionale ma consigliato
+$env:RESEND_API_KEY="re_..."
+$env:FROM_EMAIL="FantaElite <noreply@tuodominio.it>"
+
+# Ko-fi
+$env:KOFI_VERIFICATION_TOKEN="metti-qui-lo-stesso-token-che-imposti-in-ko-fi"
+*/
