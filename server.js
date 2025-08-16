@@ -20,9 +20,43 @@ const PUBLIC_URL = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
 const API_KEY = process.env.API_KEY || 'abc123!fantaElite2025';
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+// --- INCOLLA QUESTO BLOCCO IN SERVER.JS (o sostituisci la tua funzione OpenAI) ---
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL   = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const OPENAI_PROJECT = process.env.OPENAI_PROJECT; // opzionale per sk-proj-...
+
+async function callOpenAI(messages) {
+  if (!OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY assente');
+  }
+
+  const headers = {
+    'Authorization': `Bearer ${OPENAI_API_KEY}`,
+    'Content-Type': 'application/json',
+  };
+  if (OPENAI_PROJECT) {
+    headers['OpenAI-Project'] = OPENAI_PROJECT; // <- necessario con sk-proj-...
+  }
+
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      messages,
+      temperature: 0.7
+    })
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`OpenAI error ${res.status}: ${txt}`);
+  }
+
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content ?? '';
+}
+// --- FINE BLOCCO ---
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const FROM_EMAIL = process.env.FROM_EMAIL || '';
