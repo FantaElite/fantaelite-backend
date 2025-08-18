@@ -1,11 +1,10 @@
 // server.js (ESM) — Backend FantaElite
 // Avvio con:  node --env-file=.env server.js
-// Dipendenze: npm i express morgan pdfkit uuid
+// Dipendenze: npm i express morgan pdfkit
 
 import express from 'express';
 import morgan from 'morgan';
 import PDFDocument from 'pdfkit';
-import { v4 as uuidv4 } from 'uuid';
 
 // =========================
 // ENV & CONFIG
@@ -16,7 +15,7 @@ const API_KEY = process.env.API_KEY || 'abc123!fantaElite2025';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL   = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-const OPENAI_PROJECT = process.env.OPENAI_PROJECT || ''; // es: proj_xxxxx
+const OPENAI_PROJECT = process.env.OPENAI_PROJECT || ''; // es: proj_XXXX
 
 const KOFI_VERIFICATION_TOKEN = process.env.KOFI_VERIFICATION_TOKEN || '';
 
@@ -68,14 +67,12 @@ function fallbackRoster() {
 }
 
 function estraiJson(text) {
-  // Prova a trovare un array JSON nel testo
   const first = text.indexOf('[');
   const last  = text.lastIndexOf(']');
   if (first >= 0 && last > first) {
     const slice = text.slice(first, last + 1);
     try { return JSON.parse(slice); } catch {}
   }
-  // Tentativo diretto
   try { return JSON.parse(text); } catch {}
   throw new Error('Risposta OpenAI non in JSON valido');
 }
@@ -143,7 +140,6 @@ Restituisci SOLO il JSON (array) senza spiegazioni.`,
     throw new Error('OpenAI ha restituito un array vuoto o non valido');
   }
 
-  // Sanitizza minimi campi
   return arr.map(x => ({
     ruolo: String(x.ruolo || '').trim().toUpperCase(),
     nome:  String(x.nome  || '').trim(),
@@ -272,13 +268,12 @@ app.post('/api/generate', requireApiKey, async (req, res) => {
   }
 });
 
-// (Facoltativo) Ko-fi webhook minimale — qui solo valida il token e risponde OK.
-// Integra la tua logica ordini qui se necessario.
+// (Facoltativo) Ko-fi webhook minimale
 app.post('/kofi/webhook', express.json(), (req, res) => {
   const token = (req.body && (req.body.verification_token || req.body.verificationToken)) || '';
   if (!KOFI_VERIFICATION_TOKEN || token !== KOFI_VERIFICATION_TOKEN) {
     return res.status(403).json({ ok: false, error: 'Verification token non valido' });
-  }
+    }
   // TODO: crea ticket, invia email, ecc.
   res.json({ ok: true });
 });
