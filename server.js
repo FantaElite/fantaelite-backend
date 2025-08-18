@@ -1,8 +1,7 @@
 // server.js (ESM)
-// Avvio: node server.js
-// Oppure: node --env-file=.env server.js   (se vuoi caricare .env senza dotenv)
+// Avvio consigliato: node --env-file=.env server.js
 
-import 'dotenv/config'; // se non usi --env-file, questo carica .env automaticamente
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import PDFDocument from 'pdfkit';
@@ -25,7 +24,8 @@ const PUBLIC_URL = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
 // OpenAI
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL   = process.env.OPENAI_MODEL   || 'gpt-4o-mini';
-const OPENAI_PROJECT = process.env.OPENAI_PROJECT || ''; // serve solo con chiavi "sk-"
+const OPENAI_PROJECT = process.env.OPENAI_PROJECT || ''; // proj_xxx
+const OPENAI_FORCE_PROJECT_HEADER = String(process.env.OPENAI_FORCE_PROJECT_HEADER || 'false').toLowerCase() === 'true';
 
 // Ko-fi
 const KOFI_VERIFICATION_TOKEN = process.env.KOFI_VERIFICATION_TOKEN || '';
@@ -55,9 +55,16 @@ function logStartup() {
   console.log(`   - OPENAI_API_KEY: ${hasOpenAI ? 'sì' : 'NO'} (${keyType})`);
   console.log(`   - OPENAI_MODEL: ${OPENAI_MODEL}`);
   console.log(
-    `   - OPENAI_PROJECT header: ${
-      (!hasOpenAI) ? 'n/a' :
-      (OPENAI_API_KEY.startsWith('sk-proj-') ? 'NO (sk-proj- non lo richiede)' : (OPENAI_PROJECT ? `sì (${OPENAI_PROJECT})` : 'NO (manca OPENAI_PROJECT)'))
+    `   - OPENAI_PROJECT: ${OPENAI_PROJECT ? OPENAI_PROJECT : '—'}`
+  );
+  console.log(
+    `   - Header OpenAI-Project: ${
+      !hasOpenAI ? 'n/a'
+      : (OPENAI_FORCE_PROJECT_HEADER
+          ? `FORZATO (project=${OPENAI_PROJECT || 'manca'})`
+          : (OPENAI_API_KEY.startsWith('sk-proj-')
+              ? 'NO (chiave sk-proj- non lo richiede, a meno di forzatura)'
+              : (OPENAI_PROJECT ? `sì (${OPENAI_PROJECT})` : 'NO (manca OPENAI_PROJECT)')))
     }`
   );
 
@@ -85,9 +92,10 @@ async function callOpenAI(messages) {
     'Content-Type': 'application/json',
   };
 
-  // Aggiungi header di progetto SOLO se usi chiave "sk-" e hai definito OPENAI_PROJECT.
-  if (OPENAI_PROJECT && !OPENAI_API_KEY.startsWith('sk-proj-')) {
-    headers['OpenAI-Project'] = OPENAI_PROJECT;
+  // Regola: di default aggiungiamo OpenAI-Project SOLO con chiavi "sk-" e se OPENAI_PROJECT è valorizzato.
+  // Se l'utente imposta OPENAI_FORCE_PROJECT_HEADER=true, aggiungiamo SEMPRE l'header (anche con sk-proj-).
+  if ((OPENAI_PROJECT && !OPENAI_API_KEY.startsWith('sk-proj-')) || OPENAI_FORCE_PROJECT_HEADER) {
+    headers['OpenAI-Project'] = OPENAI_PROJECT || '';
   }
 
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -112,7 +120,6 @@ async function callOpenAI(messages) {
 // Generazione rosa
 // ===========================
 function buildRosaFallback(mode, budgetMin, budgetMax) {
-  // Semplice esempio statico
   const rosa = [
     { ruolo: 'P', nome: 'Portiere Solidissimo', costo: 20 },
     { ruolo: 'D', nome: 'Terzino Motorino', costo: 18 },
@@ -143,7 +150,6 @@ async function buildRosaAI(mode, budgetMin, budgetMax) {
 
   const raw = await callOpenAI([sys, usr]);
 
-  // Proviamo a trovare il JSON anche se il modello attaccasse del testo
   let jsonText = raw.trim();
   const firstBrace = jsonText.indexOf('{');
   const lastBrace  = jsonText.lastIndexOf('}');
@@ -246,7 +252,6 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-// Autenticazione semplice per API interne
 function auth(req, res, next) {
   const hdr = req.headers.authorization || '';
   const token = hdr.startsWith('Bearer ') ? hdr.slice('Bearer '.length) : '';
@@ -259,8 +264,6 @@ function auth(req, res, next) {
 // ===========================
 // Endpoints
 // ===========================
-
-// Salute
 app.get('/health', (req, res) => {
   res.json({ ok: true, uptime: process.uptime() });
 });
@@ -279,13 +282,20 @@ app.get('/debug/openai', async (req, res) => {
     let json;
     try { json = JSON.parse(body); } catch { json = { raw: content }; }
 
-    res.json({ ok: true, model: OPENAI_MODEL, projectHeader: (!OPENAI_API_KEY.startsWith('sk-proj-') && OPENAI_PROJECT) || null, reply: json });
+    res.json({
+      ok: true,
+      model: OPENAI_MODEL,
+      keyType: OPENAI_API_KEY.startsWith('sk-proj-') ? 'sk-proj' : 'sk',
+      project: OPENAI_PROJECT || null,
+      forcedHeader: OPENAI_FORCE_PROJECT_HEADER,
+      reply: json
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
 });
 
-// Generazione JSON (manuale)
+// Generazione JSON
 app.post('/api/test-generate', auth, async (req, res) => {
   const { mode = 'equilibrata', email, budgetMin = 380, budgetMax = 520 } = req.body || {};
   const base = { mode, budget: { min: budgetMin, max: budgetMax }, email, createdAt: new Date().toISOString() };
@@ -305,7 +315,7 @@ app.post('/api/test-generate', auth, async (req, res) => {
   }
 });
 
-// Generazione PDF (manuale)
+// Generazione PDF
 app.post('/api/generate', auth, async (req, res) => {
   const { mode = 'equilibrata', email, budgetMin = 380, budgetMax = 520 } = req.body || {};
   const base = { mode, budget: { min: budgetMin, max: budgetMax }, email, createdAt: new Date().toISOString() };
@@ -336,12 +346,10 @@ app.post('/api/generate', auth, async (req, res) => {
 app.post('/webhooks/kofi', async (req, res) => {
   try {
     const body = req.body || {};
-    // Verifica semplice: Ko-fi può inviare "verification_token" nel payload
     if (!KOFI_VERIFICATION_TOKEN || body.verification_token !== KOFI_VERIFICATION_TOKEN) {
       return res.status(401).json({ ok: false, error: 'Token Ko-fi non valido' });
     }
 
-    // Estrai preferenze dal payload Ko-fi (adatta alla tua mappatura)
     const mode = (body?.mode || 'equilibrata').toLowerCase();
     const email = body?.email || body?.payer_email || body?.kofi_email;
     const budgetMin = Number(body?.budgetMin ?? 380);
@@ -364,7 +372,6 @@ app.post('/webhooks/kofi', async (req, res) => {
     const payload = { mode, email, budget: { min: budgetMin, max: budgetMax }, createdAt: new Date().toISOString(), ...data };
     const pdfBuffer = await pdfBufferFromRosa(payload);
 
-    // Invia email (se configurato), altrimenti restituisci link di download
     if (RESEND_API_KEY) {
       const base64 = pdfBuffer.toString('base64');
       const resp = await sendEmailWithResend(
@@ -375,7 +382,6 @@ app.post('/webhooks/kofi', async (req, res) => {
       );
       return res.json({ ok: true, email: resp, message: 'Email inviata (se tutto ok).' });
     } else {
-      // Salva su disco per link temporaneo
       const fileId = uuidv4();
       const filePath = path.join(OUT_DIR, `kofi_${fileId}.pdf`);
       fs.writeFileSync(filePath, pdfBuffer);
@@ -388,7 +394,7 @@ app.post('/webhooks/kofi', async (req, res) => {
   }
 });
 
-// Download statici (quando non si usa email)
+// Download statici
 app.get('/download/:file', (req, res) => {
   const file = req.params.file;
   const filePath = path.join(OUT_DIR, file);
@@ -400,6 +406,15 @@ app.get('/download/:file', (req, res) => {
 // ===========================
 // Start
 // ===========================
-app.listen(PORT, () => {
+const appInstance = app.listen(PORT, () => {
   logStartup();
+});
+
+// Gestione porta occupata
+appInstance.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`❌ Porta ${PORT} occupata. Arresta il processo che la usa oppure cambia PORT.`);
+  } else {
+    console.error('❌ Errore server:', err);
+  }
 });
